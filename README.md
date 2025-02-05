@@ -1,4 +1,5 @@
 ITS2 eDNA Analysis Pipeline
+
 This repository contains a comprehensive pipeline for processing ITS2 sequences from nematoda and platyhelminthes, classifying them using both Qiime2 and Kraken2/Bracken, and performing downstream decontamination and diversity analyses in R with Phyloseq.
 
 Note: The pipeline is designed to be executed primarily on an Ubuntu system with access to the WSL or a Linux cluster environment.
