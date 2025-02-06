@@ -1,0 +1,663 @@
+######################################################################################################
+# STEP 1: CONDA ENVIRONMENT SET-UP
+######################################################################################################
+
+# Open Ubuntu and in the root path, run the following script
+
+# Create and activate the conda environment with the required packages.
+conda create -n bioenv -c bioconda -c conda-forge entrez-direct blast taxonkit kraken2 bracken wget -y
+conda activate bioenv
+
+######################################################################################################
+# STEP 2: DATABASE SETUP
+######################################################################################################
+
+# Using Ubuntu, make a new working directory for the database set-up
+
+cd /your/file/path/
+mkdir working_directory_db
+
+
+#---------------------------------------------------
+# Use esearch to download the ITS2 sequences for 
+# nematoda and platyhelminthes from the NCBI nt db.
+#---------------------------------------------------
+# Searches the NCBI nucleotide database for sequences of the given taxonomic group and target (ITS2)
+esearch -db nucleotide -query "txid6231[Organism] AND ITS2" | efetch -format fasta > nem.fasta
+
+esearch -db nucleotide -query "txid6231[Organism] AND ITS2" | efetch -format fasta > plat.fasta
+
+#---------------------------------------------------
+# Merge the 2 sequence FASTA files together.
+#---------------------------------------------------
+cat nem.fasta plat.fasta > ITS2_nematoda_platyhelminthes.fasta
+
+#---------------------------------------------------
+# Extract the sequence IDs from the merged FASTA file.
+#---------------------------------------------------
+grep "^>" ITS2_nematoda_platyhelminthes.fasta | sed 's/>//' > sequence_ids.txt
+cut -d " " -f1 sequence_ids.txt > accession_numbers.txt
+
+#---------------------------------------------------
+# Convert the sequence IDs to Tax IDs using esearch.
+#---------------------------------------------------
+split -l 500 accession_numbers.txt accession_batch_
+
+for i in accession_batch_*; do       
+    epost -db nuccore < "$i" | esummary | xtract -pattern DocumentSummary -element AccessionVersion,TaxId >> accession_taxid.tsv  
+done
+
+#---------------------------------------------------
+# Format the output file.
+#---------------------------------------------------
+cat accession_taxid.tsv | cut -f2-3 > acc_tax_clean.tsv
+cat acc_tax_clean.tsv | cut -f2 > unique_taxids.txt
+
+#---------------------------------------------------
+# Use TaxonKit to pull the full taxonomy lineage for each Tax ID.
+#---------------------------------------------------
+conda install -c bioconda taxonkit -y
+mkdir -p ~/.taxonkit
+cd ~/.taxonkit
+
+# Download the latest taxdump.tar.gz (taxonomy data from NCBI)
+wget ftp://ftp.ncbi.nih.gov/pub/taxonomy/taxdump.tar.gz
+
+# Extract the required taxonomy files.
+tar -xvzf taxdump.tar.gz names.dmp nodes.dmp delnodes.dmp merged.dmp
+
+# Remove the archive to save space.
+rm taxdump.tar.gz
+
+# Set the TaxonKit database path.
+export TAXONKIT_DB=~/.taxonkit
+
+# Retrieve full taxonomy lineages and reformat them.
+cat unique_taxids.txt | taxonkit lineage | taxonkit reformat -f "{k};{p};{c};{o};{f};{g};{s}" > taxonomy.tsv
+
+#---------------------------------------------------
+# (Manual step) Manipulate the taxonomy table:
+# Open taxonomy.tsv in Excel, use "Text to Columns" with semicolon as delimiter,
+# rearrange columns to have: TaxID, Phylum, Class, Order, Family, Genus, Species.
+# Then save the result as a Qiime2-ready format.
+#---------------------------------------------------
+
+#---------------------------------------------------
+# Link the TaxIDs back to the Accession IDs.
+#---------------------------------------------------
+awk -F'\t' 'NR==FNR {tax[$1]=$2";"$3";"$4";"$5";"$6";"$7";"$8; next} {print $1, $2, (tax[$2] ? tax[$2] : "UNKNOWN")}' OFS='\t' taxonomy.tsv acc_tax_clean.tsv > merged_accession_taxonomy.tsv
+cat merged_accession_taxonomy.tsv | cut -f1,3 > pre_qiime_taxonomy.tsv
+
+#---------------------------------------------------
+# Format the taxonomy file for Qiime2.
+#---------------------------------------------------
+awk -F'\t' 'NR==1{next} {split($2,tax,";"); for(i=1;i<=7;i++){p=substr("dpcofgs",i,1); tax[i]=(i in tax && tax[i]!="" ? p"__"tax[i] : p"__")} printf "%s\t%s", $1, tax[1]; for(i=2;i<=7;i++) printf ";%s", tax[i]; printf "\n"}' pre_qiime_taxonomy.tsv > qiime2_taxonomy.tsv
+
+
+#---------------------------------------------------
+# Format the merged sequence file for Qiime2.
+#---------------------------------------------------
+awk '/^>/ {print $1; next} {print}' ITS2_nematoda_platyhelminthes.fasta > qiime_seqs.fasta
+
+
+######################################################################################################
+# STEP 3: PROCESS THE READS IN QIIME2
+######################################################################################################
+
+# In a windows command shell run the following command to move the fastq files from your sequencing run to kelvin.
+
+# It is assumed that the files are in the format "sample_id*_R1_001.fastq.gz & sample_id*_R2_001.fastq.gz", and already dempltiplexed 
+
+# Once the fastq files and the metadata are in the same directory, use 'emacs' to make the following script for sbatch submission.
+
+
+#!/bin/sh
+
+mkdir -p qiime_output
+echo "Importing begun"
+
+qiime tools import \
+  --type 'SampleData[PairedEndSequencesWithQuality]' \
+  --input-format CasavaOneEightSingleLanePerSampleDirFmt \
+  --input-path full_fastq \
+  --output-path qiime_output/demux-paired-end.qza
+
+echo "Paired-end reads imported."
+
+qiime demux summarize \
+  --i-data qiime_output/demux-paired-end.qza \
+  --o-visualization qiime_output/demux-summary.qzv
+
+echo "Demultiplexing summary visualization created."
+
+echo "DADA2 begun"
+
+qiime dada2 denoise-paired \
+  --i-demultiplexed-seqs qiime_output/demux-paired-end.qza \
+  --p-trunc-len-f 130 \
+  --p-trunc-len-r 130 \
+  --o-representative-sequences qiime_output/rep-seqs.qza \
+  --o-table qiime_output/feature-table.qza \
+  --o-denoising-stats qiime_output/denoising-stats.qza
+
+echo "DADA2 denoising completed."
+
+qiime feature-table summarize \
+  --i-table qiime_output/feature-table.qza \
+  --o-visualization qiime_output/feature-table-summary.qzv
+
+echo "Feature table summary visualization created."
+
+qiime feature-table tabulate-seqs \
+  --i-data qiime_output/rep-seqs.qza \
+  --o-visualization qiime_output/rep-seqs-summary.qzv
+
+echo "Representative sequences summary visualization created."
+
+qiime metadata tabulate \
+  --m-input-file qiime_output/denoising-stats.qza \
+  --o-visualization qiime_output/denoising-stats-summary.qzv
+
+echo "Denoising stats summary visualization created."
+
+echo "Importing taxonomy and sequences for naïve bayes classifier training"
+
+qiime tools import \
+  --type 'FeatureData[Sequence]' \
+  --input-path qiime_seqs.fasta \
+  --output-path ref-seqs.qza
+
+qiime tools import \
+  --type 'FeatureData[Taxonomy]' \
+  --input-format HeaderlessTSVTaxonomyFormat \
+  --input-path qiime2_taxonomy.tsv \
+  --output-path ref-taxonomy.qza
+
+qiime feature-classifier fit-classifier-naive-bayes \
+  --i-reference-reads ref-seqs.qza \
+  --i-reference-taxonomy ref-taxonomy.qza \
+  --o-classifier custom-classifier.qza
+
+echo "Reference taxonomy and sequences imported, classifier trained."
+
+echo "sklearn begun"
+
+qiime feature-classifier classify-sklearn \
+  --i-classifier custom-classifier.qza \
+  --i-reads qiime_output/rep-seqs.qza \
+  --o-classification qiime_output/taxonomy_sklearn.qza
+
+echo "Taxonomic classification using sklearn completed."
+
+qiime metadata tabulate \
+  --m-input-file qiime_output/taxonomy_sklearn.qza \
+  --o-visualization qiime_output/taxonomy-sklearn-summary.qzv
+
+echo "Taxonomy summary for sklearn classifier created."
+
+qiime taxa barplot \
+  --i-table qiime_output/feature-table.qza \
+  --i-taxonomy qiime_output/taxonomy_sklearn.qza \
+  --m-metadata-file sample_metadata.txt \
+  --o-visualization qiime_output/taxa-barplot-sklearn.qzv
+
+echo "Taxa barplot for sklearn classifier generated." && \
+echo "Pipeline execution completed. Check the 'qiime_output' directory for outputs."
+
+# Send the taxa-barplot-sklearn.qzv file to qiime view, set the level to 7 and download the csv file.
+# Open the csv file in excel and remove the columns that are not count data i.e. metadata.
+# Change cell A1 to say '#NAME' 
+# Use 'ctrl + a', then copy and transpose paste the data onto another sheet, then delete the original sheet.
+
+
+######################################################################################################
+# STEP 4: KRAKEN2 & BRACKEN CLASSIFICATION
+######################################################################################################
+
+# Next, using the same database from earlier, we will classify the reads in Kraken2.
+# This is less stringent than the Qiime2 classification and tends to have a bit more noise.
+
+mkdir kraken
+cp ITS2_nematoda_platyhelminthes.fasta kraken
+cd kraken
+
+
+#---------------------------------------------------
+# Now we run Kraken2
+#---------------------------------------------------
+kraken2-build --add-to-library ITS2_nematoda_platyhelminthes.fasta --db db --threads 4
+kraken2-build --download-taxonomy --db db --threads 4
+kraken2-build --build --db db --threads 4
+bracken-build -d db -t 4 -r 150 -l S
+git clone https://github.com/jenniferlu717/KrakenTools.git
+
+
+for R1 in *_R1_001.fastq.gz; do      
+  R2="${R1/_R1_/_R2_}";      
+  [[ -f "$R2" ]] && kraken2 --db ../kraken2_full_db --threads 4 \
+     --classified-out "${R1%%_R1_001.fastq.gz}_classif#.txt" \
+     --report "${R1%%_R1_001.fastq.gz}.k2report" \
+     --output "${R1%%_R1_001.fastq.gz}.kraken2" \
+     --paired "$R1" "$R2";  
+done 
+
+for i in *.k2report; do 
+  bracken -d ../kraken2_full_db -i $i -r 150 -l S -t 10 -o bracken_results/${i%.k2report}.bracken -w bracken_results/${i%.k2report}.breport; 
+done
+
+for i in *.breport; do     
+  barc=$(echo "$i" | cut -d"." -f1);     
+  python KrakenTools-master/kreport2krona.py -r "$i" -o "${barc}.b.krona.txt" --no-intermediate-ranks; 
+done
+
+for i in *.krona.txt; do     
+  output_file=$(echo "$i" | sed 's/.krona.txt/.krona.html/');     
+  ktImportText -o "$output_file" "$i";     
+  echo "Generated: $output_file"; 
+done
+
+
+# This will produce krona plots (sample_id.krona.html) for each sample
+# The .breport files can be uploaded to https://fbreitwieser.shinyapps.io/pavian/
+# Check out Karen's git hub for more info - https://github.com/agalychnica/Pipeline_for_eDNA_with_Nanopore/wiki
+
+######################################################################################################
+# STEP : PHYLOSEQ ANALYSIS
+######################################################################################################
+
+#---------------------------------------------------
+# Now Decontam Qiime Results before Data Analysis (LINUX COMMANDS)
+#---------------------------------------------------
+# (Ensure that your Qiime2 outputs have been converted to OTU-style tables and taxonomy tables as needed)
+head -1 qiime_taxa_count_matrix.csv | sed 's/\#NAME,/\#ASVID,/' | tr "-" "." > headers_qiime_taxa_count_matrix.csv
+
+sed '1d' qiime_taxa_count_matrix.csv | awk -F',' 'BEGIN{num=1};{print "ASV_"num","$0;num=num+1}' | cut -d"," -f1,3-100 > pre-qiime_taxa_count_matrix_ASVrenamed.csv
+
+cat headers_qiime_taxa_count_matrix.csv pre-qiime_taxa_count_matrix_ASVrenamed.csv > qiime_taxa_count_matrix_ASVrenamed.csv
+
+echo "ASVID,Domain,Phylum,Class,Order,Family,Genus,Species" > header-taxonomy.txt
+sed '1d' qiime_taxa_count_matrix.csv | awk -F',' 'BEGIN{num=1};{print "ASV_"num","$1;num=num+1}' | sed 's/;__/;NA/g' > pre-taxonomy_table.csv
+cat header-taxonomy.txt pre-taxonomy_table.csv > taxonomy_table.csv
+
+# Metadata for decomtam. Done manually. I selected the columns I needed based on the example, and changed values accordingly 
+#(for example, True Sample or Control Sample, and changed some of the Group names). File is called: decontam-metadata.txt
+
+#---------------------------------------------------
+# In R
+#---------------------------------------------------
+
+library(phyloseq); packageVersion("phyloseq")
+library(ggplot2); packageVersion("ggplot2")
+library(decontam); packageVersion("decontam")
+library("biomformat");
+
+setwd("/path/to/qiime/output")
+
+#First make sure to convert or have the correct input files. In this paper we started from a Qiime2 ASV table. Follow the "Linux Commands" script to convert the files so that they can be read in this script.
+
+#read in data
+
+ASV_tab<-read.csv("qiime_taxa_count_matrix_ASVrenamed.csv", header=TRUE, sep = ",", row.names=1)
+
+taxonomy_tab<-as.matrix(read.csv("taxonomy_table.csv", header=TRUE, row.names=1, sep=","))
+
+sample_data_tab<-read.table("decontam-metadata.txt", header=TRUE, row.names=1, sep="\t")
+
+# Create phyloseq object
+OTU = otu_table(ASV_tab, taxa_are_rows = TRUE)
+TAX = tax_table(taxonomy_tab)
+sampledata = sample_data(sample_data_tab)
+
+physeq = phyloseq(OTU, TAX, sampledata)
+
+# Start decontam analysis
+ps<-physeq
+# inspect library sizes
+
+df <- as.data.frame(sample_data(ps)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_or_Control)) + geom_point()
+
+#from this graph we can see that the True samples (which include the snail, soil and Mock positive controls) have well populated library sizes (1e+05)).
+#as expected, the negative controls (in red in our case) have much lower reads. We are keeping them for now (as we use them to identify contaminants).
+
+#Check graph adding sample labels
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_or_Control)) + geom_point() + 
+  geom_text(
+    label=rownames(df), 
+    check_overlap = T
+    )
+
+# Identify Contaminants - Prevalence Method
+# For a walk through of this method used, use the following link (scroll to Point 7) of
+# https://benjjneb.github.io/decontam/vignettes/decontam_intro.html#putting-it-all-together
+
+# The prevalence (presence/absence across samples) of each sequence feature in true positive samples is compared to the prevalence in negative controls to identify contaminants.
+
+sample_data(ps)$is.neg <- sample_data(ps)$Sample_or_Control == "Control Sample"
+contamdf.prev <- isContaminant(ps, method="prevalence", neg="is.neg")
+table(contamdf.prev$contaminant)
+
+#In this case, this method has identified 7 contaminants in the data (values under "True"). To check out the top 6 contaminants:
+
+head(which(contamdf.prev$contaminant))
+
+# Repeat with more aggressive threshold (0.5):
+
+contamdf.prev05 <- isContaminant(ps, method="prevalence", neg="is.neg", threshold=0.5)
+table(contamdf.prev05$contaminant)
+
+#With the aggresive threshold the new analysis has found 13 contaminants.
+
+#Let’s take a look at the number of times several of these taxa were observed in negative controls and positive samples.
+
+# Make phyloseq object of presence-absence in negative controls and true samples
+ps.pa <- transform_sample_counts(ps, function(abund) 1*(abund>0))
+ps.pa.neg <- prune_samples(sample_data(ps.pa)$Sample_or_Control == "Control Sample", ps.pa)
+ps.pa.pos <- prune_samples(sample_data(ps.pa)$Sample_or_Control == "True Sample", ps.pa)
+
+
+# Make data.frame of prevalence in positive and negative samples
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                    contaminant=contamdf.prev05$contaminant)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+
+
+# Remove likely contanimants from the phyloseq object
+ps.noncontam <- prune_taxa(!contamdf.prev05$contaminant, ps)
+
+ps.noncontam
+
+# Save table with stats for each OTU/ASV from the prevalence analysis:
+write.table(contamdf.prev05, file="full_contaminant_analysis_results.txt", sep='\t')
+
+#Optional: Save new table (filtered from identified contaminants) in OTU style with abundances from the phyloseq object.
+#Please note: this command only outputs table with ASV labels. To obtain table with the Classification lineages, check the Linux_commands script.
+
+OTU_decont = as(otu_table(ps.noncontam), "matrix")
+
+write.table(OTU_decont, file="ASV_full_abundance.csv", sep=',')
+
+#---------------------------------------------------
+# Back in Linux shell
+#---------------------------------------------------
+
+#AFTER the Decontam analysis in R
+#To get the pruned table (filtered from contaminants) with taxonomy classification.
+
+#4. Create the full table (similar to the command to create the OTU/style table above):
+
+sed '1d' qiime_taxa_count_matrix_ASVrenamed.csv | awk -F',' 'BEGIN{num=1};{print "ASV_"num","$0;num=num+1}' > pretab.csv
+head -1 qiime_taxa_count_matrix_ASVrenamed.csv | sed 's/\#NAME,/\ASVID,/;s/,/,Taxonomy,/1' > headers_tax.csv
+cat headers_tax.csv pretab.csv > ASV_full_taxonomy_abundances_fulltable.csv
+
+
+#5. Get the list to remove:
+
+grep "TRUE" full_contaminant_analysis_results.txt | cut -f1 | tr -d '"' | sed 's/$/,/' > list_to_remove
+
+#6. Remove and prepare table as original (without ASV labels and displaying full taxonomy in first column):
+
+grep -v -f list_to_remove ASV_full_taxonomy_abundances_fulltable.csv | cut -d"," -f2-100 > Decont_Taxonomy_abundances_table.csv
+
+# Prepare the decontaminated table for Phyloseq analysis
+
+head -1 Decont_Taxonomy_abundances_table.csv | sed 's/\#NAME,/\#ASVID,/' | tr "-" "." > headers_Decont_Taxonomy_abundances_table.csv
+
+sed '1d' Decont_Taxonomy_abundances_table.csv | awk -F',' 'BEGIN{num=1};{print "ASV_"num","$0;num=num+1}' | cut -d"," -f1,3-100 > pre-Decont_Taxonomy_abundances_table_ASVrenamed.csv
+
+cat headers_Decont_Taxonomy_abundances_table.csv pre-Decont_Taxonomy_abundances_table_ASVrenamed.csv > Decont_Taxonomy_abundances_table_ASVrenamed.csv
+
+echo "ASVID,Domain,Phylum,Class,Order,Family,Genus,Species" > header-taxonomy.txt
+sed '1d' Decont_Taxonomy_abundances_table.csv | awk -F',' 'BEGIN{num=1};{print "ASV_"num","$1;num=num+1}' | sed 's/;__/;NA/g' > pre-taxonomy_table.csv
+cat header-taxonomy.txt pre-taxonomy_table.csv > taxonomy_table.csv
+
+
+#---------------------------------------------------
+# Phyloseq Analysis (BACK IN R)
+#---------------------------------------------------
+#!/usr/bin/env Rscript
+library(phyloseq)
+library(ggplot2)
+library(vegan)
+library(pheatmap)
+library(dplyr)
+library(tidyr)
+library(DESeq2)
+library(igraph)
+library(ggnetwork)
+library(reshape2)
+library(tibble)
+library(RColorBrewer)
+
+# This is the main otu_table to upload in Phyloseq, Decont_Taxonomy_abundances_table_ASVrenamed.csv, 
+# however after checking the composition of the positive and negative controls I removed them from the 
+# phyloseq analysis manually in excel, calling the file 'Decont_Taxonomy_abundances_table_ASVrenamed_no_controls.csv'
+
+otu_table_df <- read.csv("Decont_Taxonomy_abundances_table_ASVrenamed_no_controls.csv", row.names = 1)
+otu_table_df[] <- lapply(otu_table_df, as.numeric)
+tax_table_df <- read.csv("taxonomy_table.csv", row.names = 1)
+metadata_df <- read.delim("sample_metadata.txt", row.names = 1)
+
+otu <- otu_table(as.matrix(otu_table_df), taxa_are_rows = TRUE)
+tax <- tax_table(as.matrix(tax_table_df))
+meta <- sample_data(metadata_df)
+physeq <- phyloseq(otu, tax, meta)
+
+physeq <- prune_taxa(taxa_sums(physeq) > 1, physeq)
+physeq <- prune_samples(sample_sums(physeq) > 0, physeq)
+physeq_tss <- transform_sample_counts(physeq, function(x) x / sum(x))
+
+# Alpha Diversity
+
+alpha_diversity <- estimate_richness(physeq_tss, measures = c("Shannon", "Simpson"))
+
+alpha_pairwise_results <- data.frame(
+  Metric = character(),
+  Metadata = character(),
+  Comparison = character(),
+  Test = character(),
+  P.Value = numeric(),
+  FDR = numeric(),
+  stringsAsFactors = FALSE
+)
+
+metadata_vars <- colnames(metadata_df)
+for (metric in c("Shannon", "Simpson")) {
+  for (var in metadata_vars) {
+    if (length(unique(sample_data(physeq_tss)[[var]])) < 2) {
+      message(paste("Skipping variable", var, "- not enough levels for comparisons"))
+      next
+    }
+    alpha_values <- alpha_diversity[[metric]]
+    groups <- as.factor(sample_data(physeq_tss)[[var]])
+    factor_levels <- levels(groups)
+    combinations <- combn(factor_levels, 2)
+    for (i in 1:ncol(combinations)) {
+      pair <- combinations[, i]
+      subset_indices <- groups %in% pair
+      group_values <- alpha_values[subset_indices]
+      group_labels <- groups[subset_indices]
+      test_result <- wilcox.test(
+        x = group_values[group_labels == pair[1]],
+        y = group_values[group_labels == pair[2]],
+        exact = FALSE,
+        paired = FALSE
+      )
+      alpha_pairwise_results <- rbind(alpha_pairwise_results, data.frame(
+        Metric = metric,
+        Metadata = var,
+        Comparison = paste(pair[1], "vs", pair[2]),
+        Test = "Wilcoxon Rank-Sum",
+        P.Value = test_result$p.value
+      ))
+    }
+  }
+}
+alpha_pairwise_results$FDR <- p.adjust(alpha_pairwise_results$P.Value, method = "fdr")
+write.csv(alpha_pairwise_results, "alpha_diversity_pairwise_results.csv", row.names = FALSE)
+
+alpha_diversity$SampleID <- rownames(alpha_diversity)
+metadata_df$SampleID <- rownames(metadata_df)
+alpha_data <- merge(alpha_diversity, metadata_df, by = "SampleID")
+
+for (metric in c("Shannon", "Simpson")) {
+  for (var in metadata_vars) {
+    if (length(unique(alpha_data[[var]])) < 2) {
+      message(paste("Skipping variable", var, "- not enough levels for boxplot"))
+      next
+    }
+    levels_var <- levels(as.factor(alpha_data[[var]]))
+    n_colors <- length(levels_var)
+    dynamic_palette <- colorRampPalette(brewer.pal(9, "Set2"))(n_colors)
+    p <- ggplot(alpha_data, aes_string(x = var, y = metric, fill = var)) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_jitter(width = 0.2, alpha = 0.7, size = 2) +
+      scale_fill_manual(values = dynamic_palette) +
+      theme_bw() +
+      labs(title = paste(metric, "by", var),
+           x = var,
+           y = metric)
+    print(p)
+    ggsave(filename = paste0(metric, "_by_", var, "_boxplot.png"), plot = p, width = 8, height = 6, dpi = 300)
+  }
+}
+
+
+# Beta Diversity
+
+distance_metrics <- list(
+  `Bray-Curtis` = "bray", 
+  `Jaccard Index` = "jaccard",
+  `Jensen-Shannon Divergence` = function(x) phyloseq::distance(x, method = "jsd")
+)
+
+beta_pairwise_results <- data.frame(
+  Metric = character(),
+  Metadata = character(),
+  Comparison = character(),
+  F.Value = numeric(),
+  R2 = numeric(),
+  P.Value = numeric(),
+  FDR = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (metric_name in names(distance_metrics)) {
+  distance_metric <- distance_metrics[[metric_name]]
+  if (is.function(distance_metric)) {
+    dist <- distance_metric(physeq_tss)
+  } else {
+    dist <- phyloseq::distance(physeq_tss, method = distance_metric)
+  }
+  for (var in metadata_vars) {
+    if (!var %in% colnames(sample_data(physeq_tss))) {
+      message(paste("Skipping invalid metadata variable:", var))
+      next
+    }
+    factors <- as.factor(sample_data(physeq_tss)[[var]])
+    factor_levels <- levels(factors)
+    combinations <- combn(factor_levels, 2)
+    for (i in 1:ncol(combinations)) {
+      pair <- combinations[, i]
+      subset_samples <- factors %in% pair
+      sub_dist <- as.dist(as.matrix(dist)[subset_samples, subset_samples])
+      sub_factors <- factors[subset_samples]
+      adonis_res <- adonis2(sub_dist ~ sub_factors, permutations = 999)
+      beta_pairwise_results <- rbind(beta_pairwise_results, data.frame(
+        Metric = metric_name,
+        Metadata = var,
+        Comparison = paste(pair[1], "vs", pair[2]),
+        F.Value = adonis_res$F[1],
+        R2 = adonis_res$R2[1],
+        P.Value = adonis_res$`Pr(>F)`[1]
+      ))
+    }
+  }
+}
+beta_pairwise_results$FDR <- p.adjust(beta_pairwise_results$P.Value, method = "fdr")
+write.csv(beta_pairwise_results, "beta_diversity_pairwise_results.csv", row.names = FALSE)
+
+### Beta Diversity PCoA Plots with Ellipses
+for (metric_name in names(distance_metrics)) {
+  distance_metric <- distance_metrics[[metric_name]]
+  if (is.function(distance_metric)) {
+    dist <- distance_metric(physeq_tss)
+  } else {
+    dist <- phyloseq::distance(physeq_tss, method = distance_metric)
+  }
+  ordination <- ordinate(physeq_tss, method = "PCoA", distance = dist)
+  for (var in metadata_vars) {
+    if (length(unique(sample_data(physeq_tss)[[var]])) < 2) {
+      message(paste("Skipping variable", var, "for beta PCoA - not enough levels"))
+      next
+    }
+    levels_var <- levels(as.factor(sample_data(physeq_tss)[[var]]))
+    n_colors <- length(levels_var)
+    dynamic_palette <- colorRampPalette(brewer.pal(9, "Set1"))(n_colors)
+    p_beta <- plot_ordination(physeq_tss, ordination, color = var) +
+      geom_point(size = 3) +
+      stat_ellipse(level = 0.95) +
+      scale_color_manual(values = dynamic_palette) +
+      theme_bw() +
+      ggtitle(paste(metric_name, "PCoA colored by", var))
+    print(p_beta)
+    ggsave(filename = paste0("PCoA_", gsub(" ", "_", metric_name), "_by_", var, ".png"),
+           plot = p_beta, width = 8, height = 6, dpi = 300)
+  }
+}
+
+
+#Stacked Area Bar Plots
+
+taxonomy_df <- read.csv("taxonomy_table.csv", row.names = 1)
+taxonomy_split <- taxonomy_df %>%
+  mutate(Domain = ifelse(grepl("d__", Domain), gsub(".*d__", "d__", Domain), NA)) %>%
+  separate(Domain,
+           into = c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+           sep = ";", fill = "right") %>%
+  mutate(across(Phylum:Species, ~ gsub("^[a-z]__", "", .)))
+taxonomy_split[is.na(taxonomy_split) | taxonomy_split == ""] <- "Unclassified"
+taxonomy_matrix <- as.matrix(taxonomy_split)
+tax_fixed <- tax_table(taxonomy_matrix)
+physeq_fixed <- phyloseq(otu, tax_fixed, meta)
+
+tax_levels <- c("Phylum", "Class", "Order", "Family", "Genus", "Species")
+for (tax_rank in tax_levels) {
+  valid <- (tax_table(physeq_fixed)[, tax_rank] != "Unclassified" &
+            tax_table(physeq_fixed)[, tax_rank] != "NA")
+  physeq_filtered <- prune_taxa(taxa_names(physeq_fixed)[valid], physeq_fixed)
+  if (ntaxa(physeq_filtered) == 0) {
+    message(paste("Skipping taxonomic rank", tax_rank, "- no valid taxa found after filtering."))
+    next
+  }
+  physeq_tax <- tax_glom(physeq_filtered, taxrank = tax_rank)
+  physeq_tax_counts <- physeq_tax
+  tax_df <- psmelt(physeq_tax_counts)
+  tax_df[[tax_rank]] <- factor(tax_df[[tax_rank]], levels = unique(tax_df[[tax_rank]]))
+  n_colors <- length(levels(tax_df[[tax_rank]]))
+  custom_colors <- colorRampPalette(brewer.pal(9, "Paired"))(n_colors)
+  metadata_vars <- colnames(sample_data(physeq_fixed))
+  for (var in metadata_vars) {
+    if (tolower(var) %in% c("sample", "control")) {
+      message(paste("Skipping stacked bar plot for metadata variable:", var))
+      next
+    }
+    p_area <- ggplot(tax_df, aes_string(x = "Sample", y = "Abundance", fill = tax_rank)) +
+      geom_bar(stat = "identity") +
+      facet_wrap(as.formula(paste("~", var)), scales = "free_x") +
+      scale_fill_manual(values = custom_colors) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+      labs(title = paste("Stacked Bar Plot by", var, "at", tax_rank, "level"),
+           x = "Sample",
+           y = "Read Count") +
+      scale_y_log10()
+    print(p_area)
+    ggsave(filename = paste0("StackedBar_", tax_rank, "_by_", var, ".png"),
+           plot = p_area, width = 10, height = 6, dpi = 600)
+  }
+}
