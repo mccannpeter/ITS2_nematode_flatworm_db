@@ -78,7 +78,7 @@ sed 's/unclassified //g' pre-taxonomy.tsv > pre-taxonomy_cleaned.tsv
 #---------------------------------------------------
 # Link the TaxIDs back to the Accession IDs.
 #---------------------------------------------------
-awk -F'\t' 'NR==FNR {tax[$1]=$2 ";" $3 ";" $4 ";" $5 ";" $6 ";" $7 ";" $8; next} {print $1, $2, (tax[$2] ? tax[$2] : "UNKNOWN")}' OFS='\t' final_taxonomy.tsv accession_taxid.tsv > merged_accession_taxonomy.tsv
+awk -F'\t' 'NR==FNR {tax[$1]=$2";"$3";"$4";"$5";"$6";"$7";"$8; next} {print $1, $2, (tax[$2] ? tax[$2] : "UNKNOWN")}' OFS='\t' final_taxonomy.tsv accession_taxid.tsv > merged_accession_taxonomy.tsv
 cat merged_accession_taxonomy.tsv | cut -f1,3 > pre_qiime_taxonomy.tsv
 
 #---------------------------------------------------
@@ -234,7 +234,6 @@ for R1 in *_R1_001.fastq.gz; do
      --paired "$R1" "$R2";  
 done 
 
-mkdir -p bracken_results
 for i in *.k2report; do 
   bracken -d ../kraken2_full_db -i $i -r 150 -l S -t 10 -o bracken_results/${i%.k2report}.bracken -w bracken_results/${i%.k2report}.breport; 
 done
