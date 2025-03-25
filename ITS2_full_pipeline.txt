@@ -36,7 +36,7 @@ cat nem.fasta plat.fasta > ITS2_nematoda_platyhelminthes.fasta
 # Extract the sequence IDs from the merged FASTA file.
 #---------------------------------------------------
 grep "^>" ITS2_nematoda_platyhelminthes.fasta | sed 's/>//' > sequence_ids.txt
-cut -d " " -f1 sequence_ids.txt > accession_numbers.txt
+cut -d " " -f1 sequence_ids.txt | sort | uniq > accession_numbers.txt
 
 #---------------------------------------------------
 # Convert the sequence IDs to Tax IDs using esearch.
@@ -97,7 +97,7 @@ awk '/^>/ {print $1; next} {print}' ITS2_nematoda_platyhelminthes.fasta > qiime_
 # STEP 3: PROCESS THE READS IN QIIME2
 ######################################################################################################
 
-# In a windows command shell run the following command to move the fastq files from your sequencing run to kelvin.
+# In a windows command shell run the command to move the fastq files from your sequencing run to kelvin.
 
 # It is assumed that the files are in the format "sample_id*_R1_001.fastq.gz & sample_id*_R2_001.fastq.gz", and already dempltiplexed 
 
@@ -112,7 +112,7 @@ echo "Importing begun"
 qiime tools import \
   --type 'SampleData[PairedEndSequencesWithQuality]' \
   --input-format CasavaOneEightSingleLanePerSampleDirFmt \
-  --input-path full_fastq \
+  --input-path fastq \
   --output-path qiime_output/demux-paired-end.qza
 
 echo "Paired-end reads imported."
@@ -218,16 +218,19 @@ cd kraken
 #---------------------------------------------------
 # Now we run Kraken2
 #---------------------------------------------------
-kraken2-build --add-to-library ITS2_nematoda_platyhelminthes.fasta --db db --threads 4
-kraken2-build --download-taxonomy --db db --threads 4
-kraken2-build --build --db db --threads 4
-bracken-build -d db -t 4 -r 150 -l S
+.
+# This step can take a long time depending on the number of sequences in your database
+# Recommended to run on a HPC server
+kraken2-build --download-taxonomy --db kraken_ITS2_db
+kraken2-build --add-to-library ITS2_nematoda_platyhelminthes.fasta --db kraken_ITS2_db
+kraken2-build --build --db kraken_ITS2_db
+.
 git clone https://github.com/jenniferlu717/KrakenTools.git
 
 
 for R1 in *_R1_001.fastq.gz; do      
   R2="${R1/_R1_/_R2_}";      
-  [[ -f "$R2" ]] && kraken2 --db ../kraken2_full_db --threads 4 \
+  [[ -f "$R2" ]] && kraken2 --db kraken_ITS2_db --threads 4 \
      --classified-out "${R1%%_R1_001.fastq.gz}_classif#.txt" \
      --report "${R1%%_R1_001.fastq.gz}.k2report" \
      --output "${R1%%_R1_001.fastq.gz}.kraken2" \
@@ -235,18 +238,26 @@ for R1 in *_R1_001.fastq.gz; do
 done 
 
 mkdir -p bracken_results
-for i in *.k2report; do 
-  bracken -d ../kraken2_full_db -i $i -r 150 -l S -t 10 -o bracken_results/${i%.k2report}.bracken -w bracken_results/${i%.k2report}.breport; 
+bracken-build -d kraken_ITS2_db -t 4 -l 130
+
+for i in *.k2report; do
+    bracken -d kraken_ITS2_db -i "$i" -l S -t 10 \
+        -o bracken_results/${i%.k2report}.bracken \
+        -w bracken_results/${i%.k2report}.breport
 done
 
+
+cd bracken_results
+git clone https://github.com/marbl/Krona.git
+.
 for i in *.breport; do     
   barc=$(echo "$i" | cut -d"." -f1);     
-  python KrakenTools-master/kreport2krona.py -r "$i" -o "${barc}.b.krona.txt" --no-intermediate-ranks; 
+  python ../KrakenTools/kreport2krona.py -r "$i" -o "${barc}.b.krona.txt" --no-intermediate-ranks; 
 done
 
 for i in *.krona.txt; do     
   output_file=$(echo "$i" | sed 's/.krona.txt/.krona.html/');     
-  ktImportText -o "$output_file" "$i";     
+  Krona/KronaTools/scripts/ImportText.pl -o "$output_file" "$i";     
   echo "Generated: $output_file"; 
 done
 

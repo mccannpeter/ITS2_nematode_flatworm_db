@@ -36,7 +36,7 @@ cat nem.fasta plat.fasta > ITS2_nematoda_platyhelminthes.fasta
 # Extract the sequence IDs from the merged FASTA file.
 #---------------------------------------------------
 grep "^>" ITS2_nematoda_platyhelminthes.fasta | sed 's/>//' > sequence_ids.txt
-cut -d " " -f1 sequence_ids.txt > accession_numbers.txt
+cut -d " " -f1 sequence_ids.txt | sort | uniq > accession_numbers.txt
 
 #---------------------------------------------------
 # Convert the sequence IDs to Tax IDs using esearch.
@@ -78,7 +78,7 @@ sed 's/unclassified //g' pre-taxonomy.tsv > pre-taxonomy_cleaned.tsv
 #---------------------------------------------------
 # Link the TaxIDs back to the Accession IDs.
 #---------------------------------------------------
-awk -F'\t' 'NR==FNR {tax[$1]=$2";"$3";"$4";"$5";"$6";"$7";"$8; next} {print $1, $2, (tax[$2] ? tax[$2] : "UNKNOWN")}' OFS='\t' final_taxonomy.tsv accession_taxid.tsv > merged_accession_taxonomy.tsv
+awk -F'\t' 'NR==FNR {tax[$1]=$2 ";" $3 ";" $4 ";" $5 ";" $6 ";" $7 ";" $8; next} {print $1, $2, (tax[$2] ? tax[$2] : "UNKNOWN")}' OFS='\t' final_taxonomy.tsv accession_taxid.tsv > merged_accession_taxonomy.tsv
 cat merged_accession_taxonomy.tsv | cut -f1,3 > pre_qiime_taxonomy.tsv
 
 #---------------------------------------------------
@@ -218,10 +218,11 @@ cd kraken
 #---------------------------------------------------
 # Now we run Kraken2
 #---------------------------------------------------
-kraken2-build --add-to-library ITS2_nematoda_platyhelminthes.fasta --db db --threads 4
-kraken2-build --download-taxonomy --db db --threads 4
-kraken2-build --build --db db --threads 4
-bracken-build -d db -t 4 -r 150 -l S
+.
+kraken2-build --download-taxonomy --db kraken_ITS2_db
+kraken2-build --add-to-library ITS2_nematoda_platyhelminthes.fasta --db kraken_ITS2_db
+kraken2-build --build --db kraken_ITS2_db
+.
 git clone https://github.com/jenniferlu717/KrakenTools.git
 
 
@@ -234,18 +235,27 @@ for R1 in *_R1_001.fastq.gz; do
      --paired "$R1" "$R2";  
 done 
 
-for i in *.k2report; do 
-  bracken -d ../kraken2_full_db -i $i -r 150 -l S -t 10 -o bracken_results/${i%.k2report}.bracken -w bracken_results/${i%.k2report}.breport; 
+mkdir -p bracken_results
+bracken-build -d kraken_ITS2_db -t 4 -l 130
+
+for i in *.k2report; do
+    bracken -d kraken_ITS2_db -i "$i" -l S -t 10 \
+        -o bracken_results/${i%.k2report}.bracken \
+        -w bracken_results/${i%.k2report}.breport
 done
 
+
+cd bracken_results
+git clone https://github.com/marbl/Krona.git
+.
 for i in *.breport; do     
   barc=$(echo "$i" | cut -d"." -f1);     
-  python KrakenTools-master/kreport2krona.py -r "$i" -o "${barc}.b.krona.txt" --no-intermediate-ranks; 
+  python ../KrakenTools/kreport2krona.py -r "$i" -o "${barc}.b.krona.txt" --no-intermediate-ranks; 
 done
 
 for i in *.krona.txt; do     
   output_file=$(echo "$i" | sed 's/.krona.txt/.krona.html/');     
-  ktImportText -o "$output_file" "$i";     
+  Krona/KronaTools/scripts/ImportText.pl -o "$output_file" "$i";     
   echo "Generated: $output_file"; 
 done
 
